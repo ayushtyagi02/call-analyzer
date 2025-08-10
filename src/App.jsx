@@ -1,13 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, Upload, FileSpreadsheet, Calculator, AlertCircle, Phone, PhoneCall, Timer, BarChart3, Calendar, TrendingUp } from 'lucide-react';
+import { Clock, Upload, FileSpreadsheet, Calculator, AlertCircle, Phone, PhoneCall, Timer, BarChart3 } from 'lucide-react';
 
 const CallDataAnalyzer = () => {
-  const [, setFilesData] = useState([]);
-  const [dailyAnalysis, setDailyAnalysis] = useState([]);
+  const [data, setData] = useState([]);
+  const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [xlsxLoaded, setXlsxLoaded] = useState(false);
-  const [uploadedFiles, setUploadedFiles] = useState([]);
 
   // Load SheetJS library
   useEffect(() => {
@@ -42,6 +41,7 @@ const CallDataAnalyzer = () => {
       const decimalTime = parseFloat(cleanTime);
       // Excel stores time as fraction of a day, so multiply by 86400 (seconds in a day)
       const seconds = Math.round(decimalTime * 86400);
+      console.log(`Converted decimal time ${decimalTime} to ${seconds} seconds`);
       return seconds;
     }
     
@@ -56,6 +56,7 @@ const CallDataAnalyzer = () => {
       }
     }
     
+    console.log('Could not parse time:', timeStr);
     return null;
   };
 
@@ -63,6 +64,7 @@ const CallDataAnalyzer = () => {
     if (!callStartTime) return null;
     
     try {
+      // Handle various date/time formats
       let dateTime;
       if (typeof callStartTime === 'string') {
         dateTime = new Date(callStartTime);
@@ -74,33 +76,50 @@ const CallDataAnalyzer = () => {
       }
       
       return isNaN(dateTime.getTime()) ? null : dateTime;
-    // eslint-disable-next-line no-unused-vars
     } catch (e) {
+      console.error('Date parsing error:', e, callStartTime);
       return null;
     }
   };
 
-  const getDateString = (date) => {
-    return date.toDateString();
+  const formatDuration = (seconds) => {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const analyzeCallData = (callData, fileName) => {
+  const analyzeCallData = (callData) => {
+    console.log('Starting analysis with data:', callData);
+    
     if (!callData || callData.length === 0) {
+      console.log('No data to analyze');
       return null;
     }
 
-    const processedCalls = callData.map((call) => {
+    // Process and sort calls
+    console.log(typeof(callData))
+    const processedCalls = callData.map((call, index) => {
       const startTime = parseDateTime(call['Call Start Time']);
       const duration = parseTime(call['Call Length']);
       const direction = call['Call Direction']?.toString().toLowerCase();
       const result = call['Result']?.toString().toLowerCase();
+      
+      console.log(`Call ${index}:`, {
+        original: call,
+        startTime,
+        duration,
+        direction,
+        result
+      });
       
       return {
         ...call,
         startTime,
         duration,
         direction,
-        result
+        result,
+        index
       };
     });
 
@@ -108,33 +127,47 @@ const CallDataAnalyzer = () => {
       call.startTime && call.duration !== null && call.direction
     );
 
+    console.log('Valid calls after filtering:', validCalls);
+
     if (validCalls.length === 0) {
+      setError('No valid calls found. Please check your data format.');
       return null;
     }
 
     const sortedCalls = validCalls.sort((a, b) => a.startTime - b.startTime);
+
+    // Find outbound calls
     const outboundCalls = sortedCalls.filter(call => call.direction === 'outbound');
+    console.log('Outbound calls:', outboundCalls);
 
     if (outboundCalls.length === 0) {
+      setError('No outbound calls found in the data.');
       return null;
     }
 
     const firstOutbound = outboundCalls[0];
     const lastOutbound = outboundCalls[outboundCalls.length - 1];
+    
+    // Calculate total time span
     const lastCallEndTime = new Date(lastOutbound.startTime.getTime() + lastOutbound.duration * 1000);
-    const totalTimeSpan = (lastCallEndTime - firstOutbound.startTime) / 1000;
+    const totalTimeSpan = (lastCallEndTime - firstOutbound.startTime) / 1000; // in seconds
 
     let totalIdleTime = 0;
+    let idleBreakdown = [];
 
-    // Calculate idle time between outbound calls
+    // Process calls to find idle times
     for (let i = 0; i < outboundCalls.length - 1; i++) {
       const currentCall = outboundCalls[i];
       const nextCall = outboundCalls[i + 1];
       
+      // Calculate end time of current call
       const currentCallEnd = new Date(currentCall.startTime.getTime() + currentCall.duration * 1000);
-      let gapTime = (nextCall.startTime - currentCallEnd) / 1000;
+      
+      // Calculate gap time
+      let gapTime = (nextCall.startTime - currentCallEnd) / 1000; // in seconds
 
       // Find answered inbound calls in this gap
+      let inboundDuration = 0;
       const gapCalls = sortedCalls.filter(call => 
         call.startTime > currentCallEnd && 
         call.startTime < nextCall.startTime &&
@@ -142,27 +175,36 @@ const CallDataAnalyzer = () => {
         call.result === 'connected'
       );
 
-      const inboundDuration = gapCalls.reduce((sum, call) => sum + call.duration, 0);
+      inboundDuration = gapCalls.reduce((sum, call) => sum + call.duration, 0);
+
+      // Calculate actual idle time
       const actualIdleTime = gapTime - inboundDuration;
 
       // If idle time > 8 minutes (480 seconds), add to idle time
       if (actualIdleTime > 480) {
         totalIdleTime += actualIdleTime;
+        idleBreakdown.push({
+          from: currentCallEnd,
+          to: nextCall.startTime,
+          rawGap: gapTime,
+          inboundDuration,
+          idleTime: actualIdleTime,
+          gapCalls
+        });
       }
     }
 
-    const breakAllowance = 45 * 60; // 45 minutes
+    // Subtract 45 minutes (2700 seconds) break allowance
+    const breakAllowance = 45 * 60;
     const excessIdleTime = Math.max(0, totalIdleTime - breakAllowance);
+
+    // Calculate actual work time
     const actualWorkTime = totalTimeSpan - excessIdleTime;
 
-    return {
-      fileName,
-      date: getDateString(firstOutbound.startTime),
-      dateObj: firstOutbound.startTime,
+    const result = {
       totalCalls: sortedCalls.length,
       outboundCalls: outboundCalls.length,
       inboundCalls: sortedCalls.filter(call => call.direction === 'inbound').length,
-      connectedCalls: sortedCalls.filter(call => call.result === 'connected').length,
       firstCallTime: firstOutbound.startTime,
       lastCallTime: lastCallEndTime,
       totalTimeSpan,
@@ -170,20 +212,18 @@ const CallDataAnalyzer = () => {
       breakAllowance,
       excessIdleTime,
       actualWorkTime,
-      workHours: actualWorkTime / 3600,
-      breakHours: Math.min(totalIdleTime, breakAllowance) / 3600,
-      excessBreakHours: excessIdleTime / 3600
+      idleBreakdown,
+      sortedCalls
     };
+
+    console.log('Analysis result:', result);
+    return result;
   };
 
-  const handleMultipleFileUpload = async (event) => {
-    const files = Array.from(event.target.files);
-    if (files.length === 0) return;
-
-    if (files.length > 10) {
-      setError('Please select maximum 10 files at a time.');
-      return;
-    }
+  const handleFileUpload = async (event) => {
+    console.log('File upload started');
+    const file = event.target.files[0];
+    if (!file) return;
 
     if (!xlsxLoaded) {
       setError('Excel processing library not loaded yet. Please wait and try again.');
@@ -192,64 +232,39 @@ const CallDataAnalyzer = () => {
 
     setLoading(true);
     setError('');
-    setUploadedFiles([]);
-    setFilesData([]);
-    setDailyAnalysis([]);
 
     try {
-      const allAnalysisResults = [];
+      console.log('Processing file:', file.name);
+      const arrayBuffer = await file.arrayBuffer();
+      console.log('File read successfully, size:', arrayBuffer.byteLength);
+      
+      const workbook = window.XLSX.read(arrayBuffer, { type: 'array' });
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        console.log(`Processing file ${i + 1}/${files.length}:`, file.name);
+      console.log('Workbook loaded, sheets:', workbook.SheetNames);
+      
+      const sheetName = workbook.SheetNames[1];
+      const worksheet = workbook.Sheets[sheetName];
+      const jsonData = window.XLSX.utils.sheet_to_json(worksheet);
 
-        const arrayBuffer = await file.arrayBuffer();
-        const workbook = window.XLSX.read(arrayBuffer, { type: 'array' });
-        const sheetName = workbook.SheetNames[1] || workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
-        const jsonData = window.XLSX.utils.sheet_to_json(worksheet);
+      console.log('Data parsed:', jsonData.length, 'rows');
+      console.log('Sample data:', jsonData[0]);
 
-        if (jsonData.length === 0) {
-          console.warn(`No data found in file: ${file.name}`);
-          continue;
-        }
-
-        const analysisResult = analyzeCallData(jsonData, file.name);
-        if (analysisResult) {
-          allAnalysisResults.push(analysisResult);
-          setUploadedFiles(prev => [...prev, file.name]);
-        }
-      }
-
-      if (allAnalysisResults.length === 0) {
-        setError('No valid data found in any of the uploaded files.');
+      if (jsonData.length === 0) {
+        setError('No data found in the Excel file');
         return;
       }
-
-      // Sort by date
-      allAnalysisResults.sort((a, b) => a.dateObj - b.dateObj);
+      console.log(jsonData)
+      setData(jsonData);
+      const analysisResult = analyzeCallData(jsonData);
+      setAnalysis(analysisResult);
       
-      setFilesData(allAnalysisResults);
-      setDailyAnalysis(allAnalysisResults);
-
     } catch (err) {
-      console.error('Error processing files:', err);
-      setError('Error processing files: ' + err.message);
+      console.error('Error processing file:', err);
+      setError('Error processing file: ' + err.message);
     } finally {
       setLoading(false);
     }
   };
-
-  // Calculate totals
-  const totals = dailyAnalysis.length > 0 ? {
-    totalFiles: dailyAnalysis.length,
-    totalCalls: dailyAnalysis.reduce((sum, day) => sum + day.totalCalls, 0),
-    totalOutbound: dailyAnalysis.reduce((sum, day) => sum + day.outboundCalls, 0),
-    totalInbound: dailyAnalysis.reduce((sum, day) => sum + day.inboundCalls, 0),
-    totalWorkHours: dailyAnalysis.reduce((sum, day) => sum + day.workHours, 0),
-    totalBreakHours: dailyAnalysis.reduce((sum, day) => sum + day.breakHours, 0),
-    totalExcessBreak: dailyAnalysis.reduce((sum, day) => sum + day.excessBreakHours, 0),
-  } : null;
 
   return (
     <div className="min-h-screen w-full bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-100">
@@ -267,7 +282,7 @@ const CallDataAnalyzer = () => {
                     Call Data Analyzer
                   </h1>
                   <p className="text-gray-600 text-sm sm:text-base mt-1">
-                    Analyze work hours from multiple call records (up to 10 files)
+                    Analyze work hours from call records
                   </p>
                 </div>
               </div>
@@ -286,21 +301,20 @@ const CallDataAnalyzer = () => {
                   <div className="space-y-2">
                     <label htmlFor="file-upload" className="cursor-pointer">
                       <span className="text-lg sm:text-xl font-semibold text-gray-800 hover:text-blue-600 transition-colors">
-                        Upload Multiple Excel Files
+                        Upload Excel File
                       </span>
                       <input
                         id="file-upload"
                         type="file"
                         className="hidden"
                         accept=".xlsx,.xls"
-                        multiple
-                        onChange={handleMultipleFileUpload}
+                        onChange={handleFileUpload}
                         disabled={!xlsxLoaded}
                       />
                     </label>
                     <p className="text-sm sm:text-base text-gray-500 max-w-md mx-auto">
                       {xlsxLoaded 
-                        ? 'Select up to 10 Excel files containing call records. Each file will be analyzed separately and shown date-wise.' 
+                        ? 'Select an Excel file containing your call records to analyze work hours and productivity metrics' 
                         : 'Loading Excel processing library...'
                       }
                     </p>
@@ -310,19 +324,6 @@ const CallDataAnalyzer = () => {
                     <div className="flex items-center gap-2 text-blue-600">
                       <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current"></div>
                       <span className="text-sm">Loading...</span>
-                    </div>
-                  )}
-
-                  {uploadedFiles.length > 0 && (
-                    <div className="mt-4 text-sm text-gray-600">
-                      <p className="font-medium">Uploaded Files ({uploadedFiles.length}):</p>
-                      <div className="flex flex-wrap gap-2 mt-2">
-                        {uploadedFiles.map((fileName, index) => (
-                          <span key={index} className="bg-blue-100 text-blue-800 px-2 py-1 rounded text-xs">
-                            {fileName}
-                          </span>
-                        ))}
-                      </div>
                     </div>
                   )}
                 </div>
@@ -349,110 +350,182 @@ const CallDataAnalyzer = () => {
               <div className="text-center space-y-4">
                 <div className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-blue-200 border-t-blue-600"></div>
                 <div>
-                  <h3 className="text-lg font-medium text-gray-900">Processing Files</h3>
-                  <p className="text-gray-600">Analyzing your call data files...</p>
+                  <h3 className="text-lg font-medium text-gray-900">Processing File</h3>
+                  <p className="text-gray-600">Analyzing your call data...</p>
                 </div>
               </div>
             </div>
           )}
 
-          {/* Summary Cards */}
-          {totals && (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6 mb-8">
-              <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-blue-100 text-sm font-medium">Total Files</p>
-                    <p className="text-3xl font-bold">{totals.totalFiles}</p>
+          {/* Analysis Results */}
+          {analysis && (
+            <div className="space-y-8">
+              {/* Summary Cards */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6">
+                <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-blue-100 text-sm font-medium">Total Calls</p>
+                      <p className="text-3xl font-bold">{analysis.totalCalls}</p>
+                    </div>
+                    <BarChart3 className="h-8 w-8 text-blue-200" />
                   </div>
-                  <FileSpreadsheet className="h-8 w-8 text-blue-200" />
+                </div>
+
+                <div className="bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-emerald-100 text-sm font-medium">Outbound</p>
+                      <p className="text-3xl font-bold">{analysis.outboundCalls}</p>
+                    </div>
+                    <PhoneCall className="h-8 w-8 text-emerald-200" />
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-orange-100 text-sm font-medium">Inbound</p>
+                      <p className="text-3xl font-bold">{analysis.inboundCalls}</p>
+                    </div>
+                    <Phone className="h-8 w-8 text-orange-200" />
+                  </div>
+                </div>
+
+                <div className="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-purple-100 text-sm font-medium">Work Time</p>
+                      <p className="text-2xl sm:text-3xl font-bold">{formatDuration(Math.round(analysis.actualWorkTime))}</p>
+                    </div>
+                    <Timer className="h-8 w-8 text-purple-200" />
+                  </div>
                 </div>
               </div>
 
-              <div className="bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-emerald-100 text-sm font-medium">Total Calls</p>
-                    <p className="text-3xl font-bold">{totals.totalCalls}</p>
+              {/* Detailed Analysis */}
+              <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 p-6 sm:p-8">
+                <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-6 flex items-center gap-3">
+                  <Calculator className="h-6 w-6 text-blue-600" />
+                  Work Time Calculation
+                </h2>
+                
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  <div className="space-y-4">
+                    <h3 className="font-semibold text-gray-800 text-lg">Time Period</h3>
+                    <div className="space-y-3">
+                      <div className="flex flex-col sm:flex-row sm:justify-between gap-1">
+                        <span className="text-gray-600 font-medium">First Call:</span>
+                        <span className="font-semibold text-gray-900">{analysis.firstCallTime.toLocaleString()}</span>
+                      </div>
+                      <div className="flex flex-col sm:flex-row sm:justify-between gap-1">
+                        <span className="text-gray-600 font-medium">Last Call End:</span>
+                        <span className="font-semibold text-gray-900">{analysis.lastCallTime.toLocaleString()}</span>
+                      </div>
+                      <div className="flex flex-col sm:flex-row sm:justify-between gap-1">
+                        <span className="text-gray-600 font-medium">Total Time Span:</span>
+                        <span className="font-semibold text-blue-600">{formatDuration(Math.round(analysis.totalTimeSpan))}</span>
+                      </div>
+                    </div>
                   </div>
-                  <BarChart3 className="h-8 w-8 text-emerald-200" />
+
+                  <div className="space-y-4">
+                    <h3 className="font-semibold text-gray-800 text-lg">Time Deductions</h3>
+                    <div className="space-y-3">
+                      <div className="flex flex-col sm:flex-row sm:justify-between gap-1">
+                        <span className="text-gray-600 font-medium">Total Idle Time:</span>
+                        <span className="font-semibold text-red-600">{formatDuration(Math.round(analysis.totalIdleTime))}</span>
+                      </div>
+                      <div className="flex flex-col sm:flex-row sm:justify-between gap-1">
+                        <span className="text-gray-600 font-medium">Break Allowance:</span>
+                        <span className="font-semibold text-green-600">-{formatDuration(analysis.breakAllowance)}</span>
+                      </div>
+                      <div className="flex flex-col sm:flex-row sm:justify-between gap-1">
+                        <span className="text-gray-600 font-medium">Excess Idle Time:</span>
+                        <span className="font-semibold text-red-600">{formatDuration(Math.round(analysis.excessIdleTime))}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-8 pt-6 border-t border-gray-200">
+                  <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-xl p-6">
+                    <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+                      <span className="text-lg sm:text-xl font-bold text-gray-900">Actual Work Time:</span>
+                      <span className="text-2xl sm:text-3xl font-bold text-green-600">{formatDuration(Math.round(analysis.actualWorkTime))}</span>
+                    </div>
+                  </div>
                 </div>
               </div>
 
-              <div className="bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-purple-100 text-sm font-medium">Total Work Hours</p>
-                    <p className="text-3xl font-bold">{totals.totalWorkHours.toFixed(1)}h</p>
+              {/* Idle Time Breakdown */}
+              {analysis.idleBreakdown.length > 0 && (
+                <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 p-6 sm:p-8">
+                  <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-6">
+                    Idle Time Breakdown ({'>'} 8 minutes)
+                  </h2>
+                  <div className="overflow-x-auto">
+                    <table className="w-full">
+                      <thead>
+                        <tr className="bg-gray-50 rounded-lg">
+                          <th className="px-4 py-3 text-left text-sm font-semibold text-gray-600 rounded-l-lg">From</th>
+                          <th className="px-4 py-3 text-left text-sm font-semibold text-gray-600">To</th>
+                          <th className="px-4 py-3 text-left text-sm font-semibold text-gray-600">Raw Gap</th>
+                          <th className="px-4 py-3 text-left text-sm font-semibold text-gray-600">Inbound Duration</th>
+                          <th className="px-4 py-3 text-left text-sm font-semibold text-gray-600 rounded-r-lg">Idle Time</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200">
+                        {analysis.idleBreakdown.map((idle, index) => (
+                          <tr key={index} className="hover:bg-gray-50 transition-colors">
+                            <td className="px-4 py-3 text-sm text-gray-900">{idle.from.toLocaleTimeString()}</td>
+                            <td className="px-4 py-3 text-sm text-gray-900">{idle.to.toLocaleTimeString()}</td>
+                            <td className="px-4 py-3 text-sm text-gray-700">{formatDuration(Math.round(idle.rawGap))}</td>
+                            <td className="px-4 py-3 text-sm text-gray-700">{formatDuration(Math.round(idle.inboundDuration))}</td>
+                            <td className="px-4 py-3 text-sm font-semibold text-red-600">{formatDuration(Math.round(idle.idleTime))}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
-                  <Timer className="h-8 w-8 text-purple-200" />
                 </div>
-              </div>
+              )}
 
-              <div className="bg-gradient-to-br from-orange-500 to-orange-600 rounded-xl p-6 text-white shadow-lg hover:shadow-xl transition-shadow">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-orange-100 text-sm font-medium">Avg Work/Day</p>
-                    <p className="text-3xl font-bold">{(totals.totalWorkHours / totals.totalFiles).toFixed(1)}h</p>
-                  </div>
-                  <TrendingUp className="h-8 w-8 text-orange-200" />
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Daily Analysis Results */}
-          {dailyAnalysis.length > 0 && (
-            <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 p-6 sm:p-8">
-              <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-6 flex items-center gap-3">
-                <Calendar className="h-6 w-6 text-blue-600" />
-                Daily Work Summary
-              </h2>
-              
-              <div className="overflow-x-auto">
-                <table className="w-full">
-                  <thead>
-                    <tr className="bg-gray-50 rounded-lg">
-                      <th className="px-4 py-3 text-left text-sm font-semibold text-gray-600 rounded-l-lg">Date</th>
-                      <th className="px-4 py-3 text-left text-sm font-semibold text-gray-600">File Name</th>
-                      <th className="px-4 py-3 text-center text-sm font-semibold text-gray-600">Total Calls</th>
-                      <th className="px-4 py-3 text-center text-sm font-semibold text-gray-600">Outbound</th>
-                      <th className="px-4 py-3 text-center text-sm font-semibold text-gray-600">Connected</th>
-                      <th className="px-4 py-3 text-center text-sm font-semibold text-gray-600">Work Hours</th>
-                      <th className="px-4 py-3 text-center text-sm font-semibold text-gray-600">Break Hours</th>
-                      <th className="px-4 py-3 text-center text-sm font-semibold text-gray-600 rounded-r-lg">Excess Break</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-200">
-                    {dailyAnalysis.map((day, index) => (
-                      <tr key={index} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-4 py-3 text-sm font-semibold text-gray-900">{day.date}</td>
-                        <td className="px-4 py-3 text-sm text-gray-700 font-mono text-xs">{day.fileName}</td>
-                        <td className="px-4 py-3 text-sm text-center font-semibold text-blue-600">{day.totalCalls}</td>
-                        <td className="px-4 py-3 text-sm text-center text-gray-700">{day.outboundCalls}</td>
-                        <td className="px-4 py-3 text-sm text-center text-green-600 font-semibold">{day.connectedCalls}</td>
-                        <td className="px-4 py-3 text-sm text-center font-bold text-green-600">{day.workHours.toFixed(1)}h</td>
-                        <td className="px-4 py-3 text-sm text-center text-blue-600">{day.breakHours.toFixed(1)}h</td>
-                        <td className="px-4 py-3 text-sm text-center font-semibold text-red-600">
-                          {day.excessBreakHours > 0 ? `${day.excessBreakHours.toFixed(1)}h` : '-'}
-                        </td>
+              {/* Call Log */}
+              <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 p-6 sm:p-8">
+                <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-6">Call Log</h2>
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="bg-gray-50 rounded-lg">
+                        <th className="px-3 py-3 text-left text-sm font-semibold text-gray-600 rounded-l-lg">Time</th>
+                        <th className="px-3 py-3 text-left text-sm font-semibold text-gray-600">Direction</th>
+                        <th className="px-3 py-3 text-left text-sm font-semibold text-gray-600">Number</th>
+                        <th className="px-3 py-3 text-left text-sm font-semibold text-gray-600">Result</th>
+                        <th className="px-3 py-3 text-left text-sm font-semibold text-gray-600 rounded-r-lg">Duration</th>
                       </tr>
-                    ))}
-                  </tbody>
-                  <tfoot>
-                    <tr className="bg-gray-100 border-t-2 border-gray-300 font-bold">
-                      <td className="px-4 py-3 text-sm font-bold text-gray-900" colSpan="2">TOTALS</td>
-                      <td className="px-4 py-3 text-sm text-center font-bold text-blue-600">{totals.totalCalls}</td>
-                      <td className="px-4 py-3 text-sm text-center font-bold text-gray-700">{totals.totalOutbound}</td>
-                      <td className="px-4 py-3 text-sm text-center font-bold text-green-600">
-                        {dailyAnalysis.reduce((sum, day) => sum + day.connectedCalls, 0)}
-                      </td>
-                      <td className="px-4 py-3 text-sm text-center font-bold text-green-600">{totals.totalWorkHours.toFixed(1)}h</td>
-                      <td className="px-4 py-3 text-sm text-center font-bold text-blue-600">{totals.totalBreakHours.toFixed(1)}h</td>
-                      <td className="px-4 py-3 text-sm text-center font-bold text-red-600">{totals.totalExcessBreak.toFixed(1)}h</td>
-                    </tr>
-                  </tfoot>
-                </table>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200">
+                      {analysis.sortedCalls.map((call, index) => (
+                        <tr key={index} className="hover:bg-gray-50 transition-colors">
+                          <td className="px-3 py-3 text-sm text-gray-900 font-medium">{call.startTime.toLocaleTimeString()}</td>
+                          <td className="px-3 py-3">
+                            <span className={`inline-flex px-3 py-1 rounded-full text-xs font-semibold ${
+                              call.direction === 'outbound' 
+                                ? 'bg-blue-100 text-blue-800' 
+                                : 'bg-green-100 text-green-800'
+                            }`}>
+                              {call.direction}
+                            </span>
+                          </td>
+                          <td className="px-3 py-3 text-sm text-gray-700 font-mono">{call['To Number'] || call['From Number']}</td>
+                          <td className="px-3 py-3 text-sm text-gray-700 capitalize">{call.result}</td>
+                          <td className="px-3 py-3 text-sm text-gray-900 font-medium">{formatDuration(call.duration)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           )}
